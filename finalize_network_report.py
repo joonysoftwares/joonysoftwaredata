@@ -92,7 +92,7 @@ def main() -> int:
     previous_mac = str(data.get("previous_mac") or "").strip()
     change_time = str(data.get("change_time") or "").strip()
     method = str(data.get("method") or "wmac").strip().lower()
-    base_url = str(data.get("base_url") or "https://joonysoftware.xyz").rstrip("/")
+    base_url = str(data.get("base_url") or "http://localhost:4000").rstrip("/")
     guid = str(data.get("interface_guid") or "").strip()
 
     if not report_id or not license_key or not hwid:
