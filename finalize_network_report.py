@@ -18,6 +18,12 @@ try:
 except Exception:
     _CA = None
 
+# WAFs often block Python-urllib; mimic a desktop browser (same idea as loader requests).
+_HTTP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36 JoonyNetworkReportFinalize/1"
+)
+
 
 def _appdata_cache_dir() -> Path:
     return Path(os.environ.get("APPDATA", "")) / "ux-ComputerCache"
@@ -27,27 +33,65 @@ def _pending_path() -> Path:
     return _appdata_cache_dir() / "network_report_pending.json"
 
 
-def _mac_for_guid(guid: str) -> Optional[str]:
-    g = (guid or "").strip()
-    if not g:
-        return None
-    esc = g.replace("'", "''")
-    cmd = (
-        f"$a = Get-NetAdapter | Where-Object {{ $_.InterfaceGuid -eq '{esc}' }} | Select-Object -First 1; "
-        "if ($null -eq $a) { 'null' } else { ($a.MacAddress | Out-String).Trim() }"
-    )
+def _lookup_adapter_mac_via_powershell(guid: str, interface_description: str) -> Optional[str]:
+    """
+    Resolve current MAC after reboot. String -eq on InterfaceGuid often fails (brace/casing/format);
+    use [guid]::TryParse, then fall back to InterfaceDescription match.
+    """
+    env = {**os.environ, "_JOONY_NR_GUID": (guid or "").strip(), "_JOONY_NR_DESC": (interface_description or "").strip()}
+    ps = r"""
+$guidStr = $env:_JOONY_NR_GUID
+$desc = $env:_JOONY_NR_DESC
+$mac = $null
+function Get-Mac($na) {
+  if ($null -eq $na) { return $null }
+  $m = $na.MacAddress
+  if ($null -eq $m) { return $null }
+  $s = ($m | Out-String).Trim()
+  if (-not $s) { return $null }
+  return $s
+}
+$all = @(Get-NetAdapter -ErrorAction SilentlyContinue)
+# 1) GUID: parse then compare as [guid] (avoids string -eq failures)
+if ($guidStr -and $guidStr.Trim()) {
+  $parsed = $null
+  if ([guid]::TryParse($guidStr.Trim(), [ref]$parsed)) {
+    $hit = $all | Where-Object { $_.HardwareInterface -eq $true -and $_.InterfaceGuid -eq $parsed } | Select-Object -First 1
+    $mac = Get-Mac $hit
+    if (-not $mac) {
+      $hit = $all | Where-Object { $_.InterfaceGuid -eq $parsed } | Select-Object -First 1
+      $mac = Get-Mac $hit
+    }
+    if (-not $mac) {
+      $want = $parsed.ToString('D').ToLowerInvariant()
+      $hit = $all | Where-Object {
+        try { $_.InterfaceGuid.ToString('D').ToLowerInvariant() -eq $want } catch { $false }
+      } | Select-Object -First 1
+      $mac = Get-Mac $hit
+    }
+  }
+}
+# 2) Exact InterfaceDescription from pending JSON
+if (-not $mac -and $desc -and $desc.Trim()) {
+  $hit = $all | Where-Object { $_.InterfaceDescription -eq $desc.Trim() } | Select-Object -First 1
+  $mac = Get-Mac $hit
+}
+if ($mac) { Write-Output $mac } else { Write-Output 'null' }
+""".strip()
     try:
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", cmd],
+            ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True,
             text=True,
-            timeout=45,
+            timeout=60,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=env,
         )
-        t = (r.stdout or "").strip()
-        if not t or t == "null":
+        t = (r.stdout or "").strip().splitlines()
+        line = t[-1].strip() if t else ""
+        if not line or line == "null":
             return None
-        return t
+        return line
     except Exception:
         return None
 
@@ -59,18 +103,52 @@ def _normalize_mac_dashed(mac: str) -> str:
     return "-".join(s[i : i + 2] for i in range(0, 12, 2))
 
 
-def _post_json(url: str, payload: Dict[str, Any]) -> None:
+def _post_network_report(base_url: str, payload: Dict[str, Any]) -> None:
+    """
+    POST to Next `/api/network-report` first; on 405/404 (old deploy or static rules) retry
+    `/api/loader/network-report` which proxies to Express.
+    """
     body = json.dumps(payload).encode("utf-8")
-    ctx = ssl.create_default_context(cafile=_CA) if _CA else ssl.create_default_context()
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    base = base_url.rstrip("/")
+    urls = list(
+        dict.fromkeys(
+            (
+                f"{base}/api/network-report",
+                f"{base}/api/loader/network-report",
+            )
+        )
     )
-    with urllib.request.urlopen(req, context=ctx, timeout=45) as resp:
-        if resp.status not in (200, 201):
-            raise RuntimeError(f"HTTP {resp.status}")
+
+    ctx = ssl.create_default_context(cafile=_CA) if _CA else ssl.create_default_context()
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": _HTTP_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    last_err: Optional[BaseException] = None
+    for i, url in enumerate(urls):
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=45) as resp:
+                if resp.status in (200, 201):
+                    print(f"Network report POST OK: HTTP {resp.status}")
+                    return
+                raise RuntimeError(f"HTTP {resp.status}")
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (404, 405) and i < len(urls) - 1:
+                print(f"[Joony] POST {url} → HTTP {e.code}, trying fallback URL…")
+                continue
+            raise RuntimeError(f"HTTP Error {e.code}: {e.reason}") from e
+        except Exception as e:
+            last_err = e
+            if i < len(urls) - 1:
+                print(f"[Joony] POST {url} failed ({e!r}), trying fallback URL…")
+                continue
+            raise
+    if last_err:
+        raise RuntimeError(str(last_err)) from last_err
 
 
 def main() -> int:
@@ -80,8 +158,10 @@ def main() -> int:
     try:
         data = json.loads(pending.read_text(encoding="utf-8"))
     except Exception:
+        print("Error loading pending network report data")
         return 1
     if not isinstance(data, dict):
+        print("Pending network report data is not a dictionary")
         return 1
 
     report_id = str(data.get("report_id") or "").strip()
@@ -96,10 +176,15 @@ def main() -> int:
     guid = str(data.get("interface_guid") or "").strip()
 
     if not report_id or not license_key or not hwid:
+        print("Missing required fields")
         return 1
 
-    current_raw = _mac_for_guid(guid)
+    current_raw = _lookup_adapter_mac_via_powershell(guid, adapter_name)
     if not current_raw:
+        print(
+            "No current MAC found (GUID and InterfaceDescription lookup failed). "
+            f"guid={guid!r}, adapter_name={adapter_name!r}"
+        )
         return 2
 
     current_mac = _normalize_mac_dashed(current_raw)
@@ -111,9 +196,9 @@ def main() -> int:
     if method not in ("wmac", "registry"):
         method = "wmac"
     if not change_time:
+        print("Missing change time")
         return 1
 
-    url = f"{base_url}/api/loader/network-report"
     payload = {
         "reportId": report_id,
         "licenseKey": license_key,
@@ -127,19 +212,27 @@ def main() -> int:
         "method": method,
     }
     try:
-        _post_json(url, payload)
-    except Exception:
+        _post_network_report(base_url, payload)
+    except Exception as error:
+        print(f"Error posting network report: {error}")
         return 3
 
     try:
         pending.unlink()
-    except Exception:
+    except Exception as error:
+        print(f"Error unlinking pending network report: {error}")
         pass
 
     report_url = f"{base_url}/networkreport?reportId={report_id}"
     try:
-        os.startfile(report_url)  # type: ignore[attr-defined]
-    except Exception:
+        print(f"Opening report URL: {report_url}")
+        subprocess.Popen(  # noqa: S603
+            ["cmd", "/c", "start", "", report_url],
+            shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as error:
+        print(f"Error opening report URL: {error}")
         try:
             subprocess.Popen(  # noqa: S603
                 ["cmd", "/c", "start", "", report_url],
