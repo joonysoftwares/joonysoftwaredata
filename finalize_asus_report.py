@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 
 try:
     import certifi
+
     _CA = certifi.where()
 except Exception:
     _CA = None
@@ -38,16 +39,16 @@ def _pending_path() -> Path:
 
 def _collect_serials_via_powershell() -> Dict[str, Any]:
     ps = r"""
-$b    = Get-CimInstance -ClassName Win32_BaseBoard           -ErrorAction SilentlyContinue | Select-Object -First 1
-$p    = Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction SilentlyContinue | Select-Object -First 1
-$bios = Get-CimInstance -ClassName Win32_BIOS                -ErrorAction SilentlyContinue | Select-Object -First 1
+$b = Get-CimInstance -ClassName Win32_BaseBoard -ErrorAction SilentlyContinue | Select-Object -First 1
+$p = Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction SilentlyContinue | Select-Object -First 1
+$bios = Get-CimInstance -ClassName Win32_BIOS -ErrorAction SilentlyContinue | Select-Object -First 1
 @{
-  BoardManufacturer = if ($b)    { $b.Manufacturer }           else { $null }
-  BoardProduct      = if ($b)    { $b.Product }                else { $null }
-  BoardSerial       = if ($b)    { $b.SerialNumber }           else { $null }
-  SystemUUID        = if ($p)    { $p.UUID }                   else { $null }
-  SystemSerial      = if ($p)    { $p.IdentifyingNumber }      else { $null }
-  BiosSerial        = if ($bios) { $bios.SerialNumber }        else { $null }
+  BoardManufacturer = if ($b) { $b.Manufacturer } else { $null }
+  BoardProduct      = if ($b) { $b.Product } else { $null }
+  BoardSerial       = if ($b) { $b.SerialNumber } else { $null }
+  SystemUUID        = if ($p) { $p.UUID } else { $null }
+  SystemSerial      = if ($p) { $p.IdentifyingNumber } else { $null }
+  BiosSerial        = if ($bios) { $bios.SerialNumber } else { $null }
 } | ConvertTo-Json -Compress
 """.strip()
     try:
@@ -71,10 +72,14 @@ $bios = Get-CimInstance -ClassName Win32_BIOS                -ErrorAction Silent
 def _post_asus_report(base_url: str, payload: Dict[str, Any]) -> None:
     body = json.dumps(payload).encode("utf-8")
     base = base_url.rstrip("/")
-    urls = list(dict.fromkeys((
-        f"{base}/api/asus-report",
-        f"{base}/api/loader/asus-report",
-    )))
+    urls = list(
+        dict.fromkeys(
+            (
+                f"{base}/api/asus-report",
+                f"{base}/api/loader/asus-report",
+            )
+        )
+    )
 
     ctx = ssl.create_default_context(cafile=_CA) if _CA else ssl.create_default_context()
     headers = {
@@ -146,6 +151,7 @@ def main() -> int:
     prev_system_uuid = str(data.get("previous_system_uuid") or "").strip() or None
     prev_system_serial = str(data.get("previous_system_serial") or "").strip() or None
     prev_bios_serial = str(data.get("previous_bios_serial") or "").strip() or None
+    mac_entries = data.get("mac_entries") or []
 
     serials = _collect_serials_via_powershell()
     cur_board_serial = str(serials.get("BoardSerial") or "").strip() or None
@@ -171,6 +177,7 @@ def main() -> int:
         "currentSystemSerial": cur_system_serial,
         "previousBiosSerial": prev_bios_serial,
         "currentBiosSerial": cur_bios_serial,
+        "macEntries": mac_entries,
     }
 
     try:
@@ -187,7 +194,7 @@ def main() -> int:
     report_url = f"{base_url}/asusreport?reportId={report_id}"
     try:
         _log(f"ASUS report: opening report in default browser ({report_url})")
-        subprocess.Popen(
+        subprocess.Popen(  # noqa: S603
             ["cmd", "/c", "start", "", report_url],
             shell=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -195,7 +202,7 @@ def main() -> int:
     except Exception as err:
         _log(f"ASUS report: could not launch browser ({err}); retrying once")
         try:
-            subprocess.Popen(
+            subprocess.Popen(  # noqa: S603
                 ["cmd", "/c", "start", "", report_url],
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
