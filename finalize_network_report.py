@@ -210,7 +210,6 @@ def main() -> int:
         "currentMac": current_mac,
         "changeTime": change_time,
         "method": method,
-        "macEntries": data.get("mac_entries") or [],
     }
     try:
         _post_network_report(base_url, payload)
